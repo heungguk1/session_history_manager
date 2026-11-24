@@ -55,6 +55,17 @@ class ParserTests(unittest.TestCase):
             path = write_session(temp, "project", "s", [{"type": "user", "message": {"content": prompt}}])
             self.assertEqual(parse_session(path).title, "x" * 200)
 
+    def test_title_collapses_whitespace_before_truncating(self):
+        with tempfile.TemporaryDirectory() as temp:
+            prompt = "  alpha\n\t beta  " + "x" * 240
+            path = write_session(temp, "project", "s", [{"type": "user", "message": {"content": prompt}}])
+            title = parse_session(path).title
+            self.assertEqual(title[:11], "alpha beta ")
+            self.assertEqual(title, ("alpha beta " + "x" * 240)[:200])
+            self.assertEqual(len(title), 200)
+            self.assertNotIn("\n", title)
+            self.assertNotIn("\t", title)
+
     def test_environment_root_and_explicit_argument_precedence(self):
         with tempfile.TemporaryDirectory() as temp:
             env_root = Path(temp) / "env"

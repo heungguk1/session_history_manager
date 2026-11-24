@@ -1,6 +1,6 @@
 """Read-only parsing of Claude Code session JSONL files."""
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -44,7 +44,10 @@ def _timestamp(value):
     if not isinstance(value, str) or not value.strip():
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).isoformat()
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc).isoformat()
     except ValueError:
         return value
 

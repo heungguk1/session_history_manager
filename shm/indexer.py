@@ -15,6 +15,11 @@ def default_db_path(path=None):
     return Path(os.environ.get("SHM_DB_PATH", "~/.claude/session-history.sqlite3")).expanduser()
 
 
+def _like_escape(term):
+    """Escape LIKE wildcards so % and _ match literally (use with ESCAPE '\\')."""
+    return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 class SessionIndex:
     def __init__(self, db_path=None):
         self.db_path = default_db_path(db_path)
@@ -88,24 +93,38 @@ class SessionIndex:
         self.connection.commit()
         return {"indexed": indexed, "skipped": skipped, "removed": removed}
 
-    def list_sessions(self, project=None):
+    def list_sessions(self, project=None, limit=None):
         sql = "SELECT * FROM sessions"
-        args = ()
+        args = []
         if project is not None:
             sql += " WHERE project_dir=? OR project_path=?"
-            args = (project, project)
+            args = [project, project]
         sql += " ORDER BY last_timestamp DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            args.append(int(limit))
         return [dict(row) for row in self.connection.execute(sql, args)]
 
+    def find_sessions(self, prefix):
+        """Return rows whose session_id starts with prefix; exact id matches win."""
+        rows = [dict(row) for row in self.connection.execute(
+            "SELECT * FROM sessions WHERE substr(session_id, 1, ?) = ? ORDER BY last_timestamp DESC",
+            (len(prefix), prefix))]
+        exact = [row for row in rows if row["session_id"] == prefix]
+        return exact or rows
+
     def search(self, query, project=None, limit=100):
-        """Keyword search (all terms must match) over title and user text via LIKE."""
+        """Keyword search (all terms must match) over title and user text via LIKE.
+
+        The characters % and _ in terms are matched literally.
+        """
         terms = [part for part in query.split() if part]
         if not terms:
             return []
-        where = " AND ".join("(title LIKE ? OR user_text LIKE ?)" for _ in terms)
+        where = " AND ".join("(title LIKE ? ESCAPE '\\' OR user_text LIKE ? ESCAPE '\\')" for _ in terms)
         args = []
         for term in terms:
-            pattern = "%" + term + "%"
+            pattern = "%" + _like_escape(term) + "%"
             args.extend((pattern, pattern))
         if project is not None:
             where = "(" + where + ") AND (project_dir=? OR project_path=?)"

@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -66,6 +67,46 @@ class IndexerTests(unittest.TestCase):
             self.assertEqual(stats, {"indexed": 0, "skipped": 1, "removed": 1})
             self.assertEqual(ids(index.list_sessions()), ["one"])
 
+    def test_search_treats_like_wildcards_as_literals(self):
+        write_session(self.root, "p", "percent", "exact 100%", "2024-01-01T00:00:00Z")
+        write_session(self.root, "q", "thousand", "exact 1000", "2024-01-02T00:00:00Z")
+        write_session(self.root, "r", "under", "under_score", "2024-01-03T00:00:00Z")
+        write_session(self.root, "s", "underx", "underXscore", "2024-01-04T00:00:00Z")
+        write_session(self.root, "t", "slash", "back\\slash", "2024-01-05T00:00:00Z")
+        with SessionIndex(self.db) as index:
+            index.index(self.root)
+            self.assertEqual(ids(index.search("100%")), ["percent"])
+            self.assertEqual(ids(index.search("under_score")), ["under"])
+            self.assertEqual(ids(index.search("back\\slash")), ["slash"])
+            self.assertEqual(ids(index.search("1000")), ["thousand"])
+
+    def test_timestamps_normalize_offsets_and_sort_chronologically(self):
+        # 02:00+02:00 is 00:00Z, so it is chronologically before 01:30Z.
+        write_session(self.root, "p", "offset_first", "offset", "2024-01-01T02:00:00+02:00")
+        write_session(self.root, "q", "utc_second", "utc", "2024-01-01T01:30:00Z")
+        with SessionIndex(self.db) as index:
+            index.index(self.root)
+            self.assertEqual(ids(index.list_sessions()), ["utc_second", "offset_first"])
+            self.assertEqual(index.list_sessions()[1]["last_timestamp"], "2024-01-01T00:00:00+00:00")
+            self.assertEqual(ids(index.list_sessions(limit=1)), ["utc_second"])
+
+    def test_migrates_session_id_primary_key_schema(self):
+        db = sqlite3.connect(str(self.db))
+        db.execute("CREATE TABLE sessions (session_id TEXT PRIMARY KEY, project_dir TEXT, project_path TEXT, file_path TEXT, first_timestamp TEXT, last_timestamp TEXT, message_count INTEGER, user_message_count INTEGER, title TEXT, user_text TEXT, file_mtime REAL, file_size INTEGER)")
+        db.execute("INSERT INTO sessions VALUES ('old','p',NULL,'/old.jsonl',NULL,NULL,0,0,'','',0,0)")
+        db.commit()
+        db.close()
+        with SessionIndex(self.db) as index:
+            self.assertEqual(index.list_sessions(), [])
+            pk = {row["name"]: row["pk"] for row in index.connection.execute("PRAGMA table_info(sessions)")}
+            self.assertEqual(pk["session_id"], 0)
+            self.assertGreaterEqual(pk["file_path"], 1)
+            self.assertIn("malformed_lines", pk)
+            write_session(self.root, "a", "dup", "first", "2024-01-01T00:00:00Z")
+            write_session(self.root, "b", "dup", "second", "2024-01-02T00:00:00Z")
+            self.assertEqual(index.index(self.root)["indexed"], 2)
+            self.assertEqual([(r["session_id"], r["project_dir"]) for r in index.list_sessions()], [("dup", "b"), ("dup", "a")])
+
     def test_same_session_stem_in_two_projects_keeps_both_rows(self):
         write_session(self.root, "a", "dup", "first project", "2024-01-01T00:00:00Z")
         write_session(self.root, "b", "dup", "second project", "2024-01-02T00:00:00Z")
@@ -73,6 +114,8 @@ class IndexerTests(unittest.TestCase):
             self.assertEqual(index.index(self.root)["indexed"], 2)
             rows = index.list_sessions()
             self.assertEqual([(r["session_id"], r["project_dir"]) for r in rows], [("dup", "b"), ("dup", "a")])
+            self.assertEqual(len(index.find_sessions("du")), 2)
+            self.assertEqual(index.find_sessions("zz"), [])
 
     def test_like_search_matches_user_text_and_db_environment_path_is_honored(self):
         # SessionIndex.search has only a LIKE path (no FTS5), so this exercises the fallback.
