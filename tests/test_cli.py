@@ -9,10 +9,72 @@ from unittest.mock import patch
 from shm.cli import main
 
 
-def write(project, session_id, prompt, timestamp):
+def write(project, session_id, prompt, timestamp, cwd="/work/demo"):
     project.mkdir(parents=True, exist_ok=True)
-    record = {"type": "user", "cwd": "/work/demo", "timestamp": timestamp, "message": {"content": prompt}}
+    record = {"type": "user", "cwd": cwd, "timestamp": timestamp, "message": {"content": prompt}}
     (project / (session_id + ".jsonl")).write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+
+class CliWorktreeFilterTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / "sessions"
+        self.db = Path(self.temp.name) / "index.sqlite3"
+        write(self.root / "-work-demo", "abc111normal", "shared needle normal", "2024-01-02T00:00:00Z")
+        worktree = self.root / "-work-demo--director-worktrees-RUN1"
+        cwd = "/work/demo/.director_worktrees/RUN1"
+        write(worktree, "abc222tree", "shared needle tree", "2024-01-03T00:00:00Z", cwd)
+        write(worktree, "wt999only", "tree only", "2024-01-04T00:00:00Z", cwd)
+        self.call_cli("index", "--root", str(self.root), "--db", str(self.db))
+
+    def call_cli(self, *args):
+        out, err = StringIO(), StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            try:
+                code = main(list(args))
+            except SystemExit as exc:
+                code = exc.code
+        return code, out.getvalue(), err.getvalue()
+
+    def test_list_hides_worktrees_by_default_and_opt_in_restores_them(self):
+        code, out, _ = self.call_cli("list", "--json", "--db", str(self.db))
+        self.assertEqual((code, [r["session_id"] for r in json.loads(out)]), (0, ["abc111normal"]))
+        code, out, _ = self.call_cli("list", "--json", "--include-worktrees", "--db", str(self.db))
+        self.assertEqual((code, {r["session_id"] for r in json.loads(out)}),
+                         (0, {"abc111normal", "abc222tree", "wt999only"}))
+        code, out, _ = self.call_cli("list", "--db", str(self.db))
+        self.assertEqual((code, len(out.strip().splitlines())), (0, 1))
+        code, out, _ = self.call_cli("list", "--include-worktrees", "--db", str(self.db))
+        self.assertEqual((code, len(out.strip().splitlines())), (0, 3))
+
+    def test_search_hides_worktrees_by_default_and_opt_in_restores_them(self):
+        code, out, _ = self.call_cli("search", "needle", "--json", "--db", str(self.db))
+        self.assertEqual((code, [r["session_id"] for r in json.loads(out)]), (0, ["abc111normal"]))
+        code, out, _ = self.call_cli("search", "needle", "--json", "--include-worktrees", "--db", str(self.db))
+        self.assertEqual((code, {r["session_id"] for r in json.loads(out)}),
+                         (0, {"abc111normal", "abc222tree"}))
+        code, out, _ = self.call_cli("search", "needle", "--db", str(self.db))
+        self.assertEqual((code, len(out.strip().splitlines())), (0, 1))
+        code, out, _ = self.call_cli("search", "needle", "--include-worktrees", "--db", str(self.db))
+        self.assertEqual((code, len(out.strip().splitlines())), (0, 2))
+
+    def test_show_filters_prefix_matches_and_help_describes_opt_in(self):
+        code, out, err = self.call_cli("show", "wt999", "--db", str(self.db))
+        self.assertNotEqual(code, 0)
+        self.assertEqual(out, "")
+        self.assertIn("No session matches", err)
+        code, out, _ = self.call_cli("show", "wt999", "--include-worktrees", "--json", "--db", str(self.db))
+        self.assertEqual((code, json.loads(out)["session_id"]), (0, "wt999only"))
+        code, out, _ = self.call_cli("show", "abc", "--json", "--db", str(self.db))
+        self.assertEqual((code, json.loads(out)["session_id"]), (0, "abc111normal"))
+        code, out, err = self.call_cli("show", "abc", "--include-worktrees", "--db", str(self.db))
+        self.assertNotEqual(code, 0)
+        self.assertIn("ambiguous", err)
+        for command in ("list", "search", "show"):
+            code, out, _ = self.call_cli(command, "--help")
+            self.assertEqual(code, 0)
+            self.assertIn("--include-worktrees", out)
 
 
 class CliTests(unittest.TestCase):

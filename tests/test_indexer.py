@@ -67,6 +67,31 @@ class IndexerTests(unittest.TestCase):
             self.assertEqual(stats, {"indexed": 0, "skipped": 1, "removed": 1})
             self.assertEqual(ids(index.list_sessions()), ["one"])
 
+    def test_temp_sessions_hidden_project_counts_and_time_bounds(self):
+        write_records(self.root, "-keep", "keep", [dict(user("keep me", "2024-01-02T00:00:00Z"), cwd="/work/keep")])
+        write_records(self.root, "-keep", "keep2", [dict(user("keep two", "2024-01-05T00:00:00Z"), cwd="/work/keep")])
+        temps = ("/tmp/x", "/private/tmp/y", "/var/folders/a/b", "/private/var/folders/a/T/z",
+                 "/work/director-builder-1/app")
+        for number, cwd in enumerate(temps):
+            write_records(self.root, "-t{}".format(number), "temp{}".format(number),
+                          [dict(user("keep temp", "2024-02-01T00:00:00Z"), cwd=cwd)])
+        write_records(self.root, "-private-var-folders-x-T-director-builder-abc", "tempenc",
+                      [user("keep enc", "2024-02-02T00:00:00Z")])
+        with SessionIndex(self.db) as index:
+            index.index(self.root)
+            self.assertEqual(len(index.list_sessions()), 8)
+            self.assertEqual(ids(index.list_sessions(exclude_worktrees=True)), ["keep2", "keep"])
+            self.assertEqual(ids(index.search("keep", exclude_worktrees=True)), ["keep2", "keep"])
+            self.assertEqual(index.find_sessions("temp", exclude_worktrees=True), [])
+            self.assertEqual(index.project_counts(exclude_worktrees=True), [
+                {"project": "/work/keep", "count": 2, "last_timestamp": "2024-01-05T00:00:00+00:00"}])
+            self.assertEqual(len(index.project_counts()), 7)
+            bound = "2024-01-03T00:00:00+00:00"
+            self.assertEqual(ids(index.list_sessions(start=bound, exclude_worktrees=True)), ["keep2"])
+            self.assertEqual(ids(index.list_sessions(end=bound, exclude_worktrees=True)), ["keep"])
+            self.assertEqual(ids(index.search("keep", end=bound, exclude_worktrees=True)), ["keep"])
+            self.assertEqual(ids(index.search("keep", project="/work/keep", start=bound)), ["keep2"])
+
     def test_search_treats_like_wildcards_as_literals(self):
         write_session(self.root, "p", "percent", "exact 100%", "2024-01-01T00:00:00Z")
         write_session(self.root, "q", "thousand", "exact 1000", "2024-01-02T00:00:00Z")

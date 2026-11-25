@@ -20,6 +20,8 @@ def _parser():
         if name == "search":
             command.add_argument("query", nargs="+", help="keyword search terms")
         command.add_argument("--project", help="filter by project directory or path")
+        command.add_argument("--include-worktrees", action="store_true",
+                             help="include Director worktree sessions")
         command.add_argument("--limit", type=int, default=100, help="maximum sessions to show")
         command.add_argument("--json", action="store_true", dest="as_json", help="print a JSON array")
     web = commands.add_parser("serve", parents=[common], help="serve the local web dashboard")
@@ -27,6 +29,8 @@ def _parser():
     web.add_argument("--host", default="127.0.0.1", help="loopback address to listen on")
     show = commands.add_parser("show", parents=[common], help="show metadata for one session")
     show.add_argument("session", help="session id or unique prefix")
+    show.add_argument("--include-worktrees", action="store_true",
+                      help="include Director worktree sessions")
     show.add_argument("--json", action="store_true", dest="as_json", help="print JSON")
     return parser
 
@@ -41,7 +45,7 @@ def _display(rows):
 
 
 def _show(index, args):
-    matches = index.find_sessions(args.session)
+    matches = index.find_sessions(args.session, exclude_worktrees=not args.include_worktrees)
     if not matches:
         print("No session matches prefix: " + args.session, file=sys.stderr)
         return 2
@@ -93,9 +97,13 @@ def main(argv=None):
             if args.command == "show":
                 return _show(index, args)
             if args.command == "list":
-                rows = index.list_sessions(project=args.project, limit=max(0, args.limit))
+                rows = index.list_sessions(
+                    project=args.project, limit=max(0, args.limit),
+                    exclude_worktrees=not args.include_worktrees)
             else:
-                rows = index.search(" ".join(args.query), project=args.project, limit=max(0, args.limit))
+                rows = index.search(
+                    " ".join(args.query), project=args.project, limit=max(0, args.limit),
+                    exclude_worktrees=not args.include_worktrees)
         if args.as_json:
             print(json.dumps(rows, ensure_ascii=False))
         else:
