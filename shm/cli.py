@@ -1,6 +1,7 @@
 """Command-line interface for the session history manager."""
 import argparse
 import json
+import sqlite3
 import sys
 
 from .indexer import SessionIndex
@@ -21,6 +22,9 @@ def _parser():
         command.add_argument("--project", help="filter by project directory or path")
         command.add_argument("--limit", type=int, default=100, help="maximum sessions to show")
         command.add_argument("--json", action="store_true", dest="as_json", help="print a JSON array")
+    web = commands.add_parser("serve", parents=[common], help="serve the local web dashboard")
+    web.add_argument("--port", type=int, default=8765, help="port to listen on (0 chooses a free port)")
+    web.add_argument("--host", default="127.0.0.1", help="loopback address to listen on")
     show = commands.add_parser("show", parents=[common], help="show metadata for one session")
     show.add_argument("session", help="session id or unique prefix")
     show.add_argument("--json", action="store_true", dest="as_json", help="print JSON")
@@ -54,9 +58,32 @@ def _show(index, args):
     return 0
 
 
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+def _serve(args):
+    """Run the read-only dashboard; refuse anything but a loopback host."""
+    if args.host not in LOOPBACK_HOSTS:
+        print("shm: --host must be a loopback address ({})".format(", ".join(LOOPBACK_HOSTS)),
+              file=sys.stderr)
+        return 2
+    if not 0 <= args.port <= 65535:
+        print("shm: --port must be between 0 and 65535", file=sys.stderr)
+        return 2
+    try:
+        from .web import serve
+        serve(args.db, args.host, args.port)
+        return 0
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        print("shm: {}".format(exc), file=sys.stderr)
+        return 2
+
+
 def main(argv=None):
     parser = _parser()
     args = parser.parse_args(argv)
+    if args.command == "serve":
+        return _serve(args)
     try:
         with SessionIndex(args.db) as index:
             if args.command == "index":
@@ -74,14 +101,9 @@ def main(argv=None):
         else:
             _display(rows)
         return 0
-    except (OSError, ValueError, sqlite3_error()) as exc:
+    except (OSError, ValueError, sqlite3.Error) as exc:
         print("shm: {}".format(exc), file=sys.stderr)
         return 2
-
-
-def sqlite3_error():
-    import sqlite3
-    return sqlite3.Error
 
 
 if __name__ == "__main__":

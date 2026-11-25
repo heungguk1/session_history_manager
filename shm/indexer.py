@@ -1,12 +1,43 @@
 """SQLite index and search APIs for parsed Claude sessions.
 
-Search uses SQL LIKE only (no FTS5 dependency), so it works on any SQLite build.
+Search uses plain ``LIKE`` matching with ``%``, ``_`` and the escape character
+escaped so user terms match literally. FTS5 is intentionally not used, so the
+index works with any SQLite build.
 """
 import os
 from pathlib import Path
 import sqlite3
+import urllib.parse
 
 from .parser import claude_root, discover_sessions, parse_session
+
+# Single source of truth for hiding Director worktree sessions. It is applied in
+# SQL before LIMIT so hidden rows never use up a result limit. Literal '_' is
+# escaped with ESCAPE '\\' and '\\\\' in a pattern matches one literal backslash.
+# Patterns match .director_worktrees only as a whole path segment.
+_WORKTREE_EXCLUDE_SQL = r"""NOT (
+    COALESCE(project_path, '') LIKE '%/.director\_worktrees/%' ESCAPE '\'
+    OR COALESCE(project_path, '') LIKE '%/.director\_worktrees' ESCAPE '\'
+    OR COALESCE(project_path, '') LIKE '%\\.director\_worktrees\\%' ESCAPE '\'
+    OR COALESCE(project_path, '') LIKE '%\\.director\_worktrees' ESCAPE '\'
+    OR COALESCE(project_path, '') LIKE '.director\_worktrees/%' ESCAPE '\'
+    OR COALESCE(project_path, '') LIKE '.director\_worktrees\\%' ESCAPE '\'
+    OR COALESCE(project_path, '') = '.director_worktrees'
+    OR COALESCE(project_dir, '') = '--director-worktrees'
+    OR COALESCE(project_dir, '') LIKE '%--director-worktrees' ESCAPE '\'
+    OR COALESCE(project_dir, '') LIKE '%--director-worktrees-%' ESCAPE '\'
+    OR COALESCE(project_dir, '') LIKE '%-.director\_worktrees' ESCAPE '\'
+    OR COALESCE(project_dir, '') LIKE '%-.director\_worktrees-%' ESCAPE '\'
+    OR COALESCE(project_dir, '') LIKE '%--director\_worktrees' ESCAPE '\'
+    OR COALESCE(project_dir, '') LIKE '%--director\_worktrees-%' ESCAPE '\'
+    OR COALESCE(file_path, '') LIKE '%/.director\_worktrees/%' ESCAPE '\'
+    OR COALESCE(file_path, '') LIKE '%/.director\_worktrees' ESCAPE '\'
+    OR COALESCE(file_path, '') LIKE '%\\.director\_worktrees\\%' ESCAPE '\'
+    OR COALESCE(file_path, '') LIKE '%\\.director\_worktrees' ESCAPE '\'
+    OR COALESCE(file_path, '') LIKE '.director\_worktrees/%' ESCAPE '\'
+    OR COALESCE(file_path, '') LIKE '.director\_worktrees\\%' ESCAPE '\'
+    OR COALESCE(file_path, '') = '.director_worktrees'
+)"""
 
 
 def default_db_path(path=None):
@@ -16,22 +47,32 @@ def default_db_path(path=None):
 
 
 def _like_escape(term):
-    """Escape LIKE wildcards so % and _ match literally (use with ESCAPE '\\')."""
+    """Escape LIKE wildcards so ``term`` matches literally with ``ESCAPE '\\'``."""
     return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 class SessionIndex:
-    def __init__(self, db_path=None):
+    def __init__(self, db_path=None, *, read_only=False):
         self.db_path = default_db_path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.connection = sqlite3.connect(str(self.db_path))
+        if read_only:
+            if not self.db_path.is_file():
+                raise FileNotFoundError(
+                    "Database not found at {}; run `python -m shm index`.".format(self.db_path))
+            uri = "file:{}?mode=ro".format(urllib.parse.quote(str(self.db_path)))
+            self.connection = sqlite3.connect(uri, uri=True)
+        else:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            self.connection = sqlite3.connect(str(self.db_path))
         self.connection.row_factory = sqlite3.Row
-        self._setup()
+        if not read_only:
+            self._setup()
 
     def _setup(self):
+        # Older schemas keyed rows by session_id, which collides when two projects
+        # share a session file stem. Drop such a table; it is rebuilt keyed by file_path
+        # and repopulated by the next index run.
         info = list(self.connection.execute("PRAGMA table_info(sessions)"))
         if any(row["name"] == "session_id" and row["pk"] for row in info):
-            # Older schema keyed on session_id; the index is a rebuildable cache.
             self.connection.execute("DROP TABLE sessions")
         self.connection.execute("""CREATE TABLE IF NOT EXISTS sessions (
             session_id TEXT NOT NULL, project_dir TEXT NOT NULL, project_path TEXT,
@@ -70,7 +111,12 @@ class SessionIndex:
               meta.file_size, meta.malformed_lines))
 
     def index(self, root=None, incremental=False):
-        """Index files. Incremental mode skips unchanged size/mtime pairs."""
+        """Parse session files under ``root`` and store their metadata.
+
+        With ``incremental`` set, files whose mtime and size are unchanged are
+        skipped. Rows for files that disappeared from ``root`` are removed. Source
+        files are only read. Returns counts of indexed, skipped and removed files.
+        """
         paths = list(discover_sessions(root))
         existing = {row["file_path"]: (row["file_mtime"], row["file_size"])
                     for row in self.connection.execute("SELECT file_path,file_mtime,file_size FROM sessions")}
@@ -93,30 +139,46 @@ class SessionIndex:
         self.connection.commit()
         return {"indexed": indexed, "skipped": skipped, "removed": removed}
 
-    def list_sessions(self, project=None, limit=None):
-        sql = "SELECT * FROM sessions"
-        args = []
+    def list_sessions(self, project=None, limit=None, *, exclude_worktrees=False):
+        """Return sessions newest first, optionally filtered by project.
+
+        ``project`` matches project_dir or project_path. ``exclude_worktrees``
+        hides Director worktree sessions in SQL before ``limit`` is applied.
+        """
+        clauses, args = [], []
         if project is not None:
-            sql += " WHERE project_dir=? OR project_path=?"
-            args = [project, project]
+            clauses.append("(project_dir=? OR project_path=?)")
+            args.extend((project, project))
+        if exclude_worktrees:
+            clauses.append(_WORKTREE_EXCLUDE_SQL)
+        sql = "SELECT * FROM sessions" + (" WHERE " + " AND ".join(clauses) if clauses else "")
         sql += " ORDER BY last_timestamp DESC"
         if limit is not None:
             sql += " LIMIT ?"
             args.append(int(limit))
         return [dict(row) for row in self.connection.execute(sql, args)]
 
-    def find_sessions(self, prefix):
-        """Return rows whose session_id starts with prefix; exact id matches win."""
+    def find_sessions(self, prefix, *, exclude_worktrees=False):
+        """Return sessions whose id starts with ``prefix``; an exact id match wins.
+
+        The prefix is compared with substr, so LIKE wildcards are not special.
+        ``exclude_worktrees`` hides Director worktree sessions in SQL.
+        """
+        where = "substr(session_id, 1, ?) = ?"
+        args = [len(prefix), prefix]
+        if exclude_worktrees:
+            where += " AND " + _WORKTREE_EXCLUDE_SQL
         rows = [dict(row) for row in self.connection.execute(
-            "SELECT * FROM sessions WHERE substr(session_id, 1, ?) = ? ORDER BY last_timestamp DESC",
-            (len(prefix), prefix))]
+            "SELECT * FROM sessions WHERE " + where + " ORDER BY last_timestamp DESC", args)]
         exact = [row for row in rows if row["session_id"] == prefix]
         return exact or rows
 
-    def search(self, query, project=None, limit=100):
-        """Keyword search (all terms must match) over title and user text via LIKE.
+    def search(self, query, project=None, limit=100, *, exclude_worktrees=False):
+        """Return sessions whose title or user text contains every query term.
 
-        The characters % and _ in terms are matched literally.
+        Terms are whitespace-separated and matched literally with LIKE (no FTS5),
+        newest first. ``project`` matches project_dir or project_path, and
+        ``exclude_worktrees`` hides Director worktree sessions before the LIMIT.
         """
         terms = [part for part in query.split() if part]
         if not terms:
@@ -126,11 +188,14 @@ class SessionIndex:
         for term in terms:
             pattern = "%" + _like_escape(term) + "%"
             args.extend((pattern, pattern))
+        clauses = ["(" + where + ")"]
         if project is not None:
-            where = "(" + where + ") AND (project_dir=? OR project_path=?)"
+            clauses.append("(project_dir=? OR project_path=?)")
             args.extend((project, project))
+        if exclude_worktrees:
+            clauses.append(_WORKTREE_EXCLUDE_SQL)
         args.append(int(limit))
-        sql = "SELECT * FROM sessions WHERE " + where + " ORDER BY last_timestamp DESC LIMIT ?"
+        sql = "SELECT * FROM sessions WHERE " + " AND ".join(clauses) + " ORDER BY last_timestamp DESC LIMIT ?"
         return [dict(row) for row in self.connection.execute(sql, args)]
 
 
