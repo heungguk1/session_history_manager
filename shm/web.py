@@ -9,10 +9,12 @@ import json
 import socket
 import sqlite3
 from datetime import date, datetime, time as dt_time, timedelta, timezone
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 
 from .indexer import SessionIndex, default_db_path
+from .parser import read_messages
 
 HTML_TYPE = "text/html; charset=utf-8"
 JSON_TYPE = "application/json; charset=utf-8"
@@ -22,11 +24,10 @@ KST_FALLBACK = timezone(timedelta(hours=9), "KST")
 PREVIEW_LIMIT = 120
 # Each period is (label, days before today); None clears the date range.
 _PERIODS = (("오늘", 0), ("7일", 6), ("30일", 29), ("전체", None))
-_STYLE = (
-    "body{font:16px sans-serif;max-width:1000px;margin:2rem auto;padding:0 1rem}"
-    "li{margin:.5rem 0}pre{white-space:pre-wrap;overflow-wrap:anywhere}"
-)
-_NAV = '<nav><a href="/">Sessions</a> · <a href="/search">Search</a></nav>'
+# Edited as a real CSS file; inlined into every page so each page is self-contained.
+_STYLE = (Path(__file__).with_name("static") / "style.css").read_text(encoding="utf-8")
+_NAV = ('<a class="brand" href="/">Session History</a>'
+        '<nav><a href="/">Sessions</a><a href="/search">Search</a></nav>')
 _SIMPLE_ROUTES = {
     "/": "list", "/api/sessions": "list", "/search": "search", "/api/search": "search"
 }
@@ -132,12 +133,21 @@ def _json(data):
     return json.dumps(data, ensure_ascii=False)
 
 
-def render_page(title, body, page_class="content"):
-    """Build the common document frame for every HTML screen."""
-    head = '<meta charset="utf-8"><title>{}</title><style>{}</style>'.format(_e(title), _STYLE)
-    return ('<!doctype html><html><head>{}</head><body><header class="site-header">{}</header>'
-            '<main class="page page-{}"><h1>{}</h1>{}</main></body></html>').format(
-                head, _NAV, _e(page_class), _e(title), body)
+def render_page(title, body, page_class="content", aside=None, heading=None):
+    """Build the common document frame for every HTML screen.
+
+    ``aside`` (HTML) adds the left sidebar; ``heading`` overrides the visible h1 while
+    ``title`` stays the document title.
+    """
+    head = ('<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+            '<title>{}</title><style>{}</style>').format(_e(title), _STYLE)
+    content = '<div class="content"><h1>{}</h1>{}</div>'.format(
+        _e(title if heading is None else heading), body)
+    if aside is not None:
+        content = '<div class="layout"><aside class="sidebar">{}</aside>{}</div>'.format(aside, content)
+    return ('<!doctype html><html lang="ko"><head>{}</head><body><header class="site-header">{}</header>'
+            '<main class="page page-{}">{}</main></body></html>').format(
+                head, _NAV, _e(page_class), content)
 
 
 def _page(title, body):
@@ -207,10 +217,13 @@ def _row_item(row, labels, now, tz):
     link = ('<a class="session-title" href="/session/{}">'
             '<span class="session-preview">{}</span></a>').format(
                 quote(session_id, safe=""), _e(preview_text(row.get("title")) or session_id))
-    return ('<li class="session-card">{} · <span class="session-count">메시지 {}개</span> · '
-            '<span class="session-time">{}</span> · <span title="{}">{}</span></li>').format(
-                link, _e(row.get("message_count") or 0), _e(when), _e(project),
-                _e(labels.get(project, project)))
+    meta = ('<span class="session-meta"><span class="project-badge"><span title="{}">{}</span></span>'
+            '<span class="session-count">메시지 {}개</span> · '
+            '<span class="session-time">{}</span></span>').format(
+                _e(project), _e(labels.get(project, project)),
+                _e(row.get("message_count") or 0), _e(when))
+    # The whole card is one link: the preview and the meta line both sit inside it.
+    return '<li class="session-card">{}</li>'.format(link.replace("</a>", meta + "</a>"))
 
 
 def _rows(rows, labels=None, now=None, tz=None):
@@ -234,8 +247,28 @@ def _period_links(filters, now):
         start = end = ""
         if days is not None:
             start, end = (today - timedelta(days=days)).isoformat(), today.isoformat()
-        links.append('<a href="{}">{}</a>'.format(_e(_list_url(filters, start, end)), label))
-    return '<p class="period-links">{}</p>'.format(" · ".join(links))
+        active = (_day_text(filters["from"]), _day_text(filters["to"])) == (start, end)
+        links.append('<span class="period{}"><a href="{}">{}</a></span>'.format(
+            " is-active" if active else "", _e(_list_url(filters, start, end)), label))
+    return '<p class="period-links">{}</p>'.format("".join(links))
+
+
+def _project_nav(filters, projects, labels):
+    """Sidebar: every project with its session count; links keep the other filters."""
+    current = filters["project"] or ""
+    total = sum(int(item["count"]) for item in projects)
+    entries = [("", "전체 프로젝트", total)] + [
+        (item["project"] or "", labels.get(item["project"], item["project"]), int(item["count"]))
+        for item in projects]
+    items = []
+    for value, label, count in entries:
+        href = _list_url(dict(filters, project=value or None),
+                         _day_text(filters["from"]), _day_text(filters["to"]))
+        items.append('<li class="{}"><a href="{}" title="{}"><span>{}</span>'
+                     '<span class="badge">{}</span></a></li>'.format(
+                         "is-active" if value == current else "", _e(href), _e(value or label),
+                         _e(label), count))
+    return '<p class="sidebar-title">프로젝트</p><ul class="project-nav">{}</ul>'.format("".join(items))
 
 
 def _filter_form(filters, projects, labels):
@@ -266,10 +299,11 @@ def _listing(rows, filters, projects, now, tz):
 
 
 def _search_form(term, project, limit):
-    fields = ('<input name="q" value="{}"><input name="project" value="{}">'
-              '<input name="limit" value="{}">').format(
+    fields = ('<label>검색어 <input name="q" value="{}"></label>'
+              '<label>프로젝트 경로 <input name="project" value="{}"></label>'
+              '<label>최대 개수 <input name="limit" value="{}"></label>').format(
                   _e(term), _e(project or ""), _e(limit))
-    return '<form class="search-form">{}<button>Search</button></form>'.format(fields)
+    return '<form class="search-form">{}<button>검색</button></form>'.format(fields)
 
 
 def _candidates_html(matches):
@@ -278,10 +312,40 @@ def _candidates_html(matches):
     return "<p>Several sessions match; use a longer prefix.</p><ul>{}</ul>".format(items)
 
 
-def _detail_html(row):
+def _detail_html(row, now=None, tz=None):
+    project = _project_label(row)
+    label = project_labels([project]).get(project, project)
+    head = ('<section class="detail-head"><a class="back-link" href="/">← 목록으로</a>'
+            '<h2>{}</h2><div class="session-meta"><span class="project-badge" title="{}">{}</span>'
+            '<span>{} ~ {}</span><span>메시지 {}개</span></div></section>').format(
+                _e(preview_text(row.get("title"), 200) or row.get("session_id")), _e(project), _e(label),
+                _e(format_local_time(row.get("first_timestamp"), now, tz)),
+                _e(format_local_time(row.get("last_timestamp"), now, tz)),
+                _e(row.get("message_count") or 0))
+    try:
+        messages, truncated = read_messages(row["file_path"])
+    except (OSError, KeyError, TypeError):
+        messages, truncated = None, False
+    if messages is None:
+        conversation = '<p class="notice">세션 파일을 읽을 수 없습니다. 파일이 옮겨졌거나 삭제됐을 수 있습니다.</p>'
+    elif not messages:
+        conversation = '<p class="notice">표시할 대화 내용이 없습니다.</p>'
+    else:
+        bubbles = "".join(
+            '<div class="bubble {}"><div class="bubble-meta">{} · {}</div>'
+            '<div class="bubble-text">{}</div></div>'.format(
+                "user" if m["role"] == "user" else "assistant",
+                "나" if m["role"] == "user" else "Claude",
+                _e(format_local_time(m["timestamp"], now, tz)), _e(m["text"]))
+            for m in messages)
+        more = ('<p class="notice">대화가 길어 앞부분 {}개 메시지만 표시합니다.</p>'.format(len(messages))
+                if truncated else "")
+        conversation = '<section class="conversation">{}</section>{}'.format(bubbles, more)
     items = "".join("<dt>{}</dt><dd><pre>{}</pre></dd>".format(
         _e(key), _e(value)) for key, value in row.items())
-    return '<dl class="session-detail">{}</dl>'.format(items)
+    info = ('<details class="session-info"><summary>세션 정보</summary>'
+            '<dl class="session-detail">{}</dl></details>').format(items)
+    return head + conversation + info
 
 
 def render_empty_result(reset_href):
@@ -305,7 +369,8 @@ def render_list_page(rows, filters, projects, now, tz):
     listing = ('<div class="project-list">{}</div>'.format(sections) if sections else
                render_empty_result("/"))
     body = _filter_form(filters, projects, labels) + _period_links(filters, now) + listing
-    return render_page("Sessions", body, "list")
+    return render_page("Sessions", body, "list", aside=_project_nav(filters, projects, labels),
+                       heading="세션 목록")
 
 
 def render_search_page(term, project, limit, rows, now, tz):
@@ -315,11 +380,13 @@ def render_search_page(term, project, limit, rows, now, tz):
         results = render_empty_result("/search")
     else:
         results = "<ul></ul>"
-    return render_page("Search", _search_form(term, project, limit) + results, "search")
+    return render_page("Search", _search_form(term, project, limit) + results, "search",
+                       heading="세션 검색")
 
 
-def render_detail_page(row):
-    return render_page("Session " + str(row["session_id"]), _detail_html(row), "detail")
+def render_detail_page(row, now=None, tz=None):
+    title = "Session " + str(row["session_id"])
+    return render_page(title, _detail_html(row, now, tz), "detail", heading=title)
 
 
 def render_candidates_page(matches):
@@ -332,8 +399,9 @@ def render_error_page(title, message):
 
 def render_db_unavailable_page(message):
     return render_page(
-        "Database unavailable", '<div class="db-unavailable">{}</div>'.format(_e(message)),
-        "db-unavailable")
+        "Database unavailable",
+        '<div class="db-unavailable">{}<br><br>먼저 <code>python3 -m shm index</code> 를 실행하세요.</div>'.format(
+            _e(message)), "db-unavailable", heading="색인 데이터베이스가 없습니다")
 
 
 def _error(code, message, api):
@@ -399,7 +467,8 @@ def _detail_response(index, prefix, api):
     row = matches[0]
     if api:
         return 200, _json(row), JSON_TYPE
-    return 200, render_detail_page(row), HTML_TYPE
+    tz = default_timezone()
+    return 200, render_detail_page(row, _local_now(tz), tz), HTML_TYPE
 
 
 def _respond(index, kind, ident, query, api):

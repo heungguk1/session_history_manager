@@ -12,6 +12,7 @@ import urllib.parse
 from .parser import claude_root, discover_sessions, parse_session
 
 # Single source of truth for hiding Director worktree and temp-folder sessions
+# (and, below, the sessions of Director's own role prompts)
 # (paths containing /director-builder-, or project paths under /tmp, /private/tmp,
 # /var/folders or /private/var/folders and their encoded project_dir forms).
 # Temp prefixes are matched on project_path/project_dir only: index files
@@ -55,6 +56,20 @@ _WORKTREE_EXCLUDE_SQL = r"""NOT (
     OR COALESCE(project_dir, '') IN ('-tmp', '-private-tmp')
     OR COALESCE(project_dir, '') LIKE '%-director-builder-%'
 )"""
+
+# Sessions that AI DEV DIRECTOR itself opened when it ran an AI in the HEAD / BUILDER /
+# REVIEWER role: they are machine prompts, not the user's conversations. The title is
+# the whitespace-collapsed first prompt, so a fixed prefix identifies them.
+DIRECTOR_PROMPT_PREFIXES = (
+    "You are HEAD, driving a multi-step development MISSION",
+    "You are the HEAD architect",
+    "You are the implementation Builder.",
+    "You are an expert read-only code reviewer",
+)
+_WORKTREE_EXCLUDE_SQL = "(" + _WORKTREE_EXCLUDE_SQL + "".join(
+    "\n    AND COALESCE(title, '') NOT LIKE '{}%' ESCAPE '\\'".format(
+        prefix.replace("'", "''").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_"))
+    for prefix in DIRECTOR_PROMPT_PREFIXES) + ")"
 
 
 def default_db_path(path=None):

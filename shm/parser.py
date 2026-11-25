@@ -115,3 +115,37 @@ def parse_session(file_path) -> SessionMeta:
 
 def parse_sessions(root=None):
     return [parse_session(path) for path in discover_sessions(root)]
+
+
+def read_messages(file_path, limit=400, max_chars=20000):
+    """Return the conversation of one session file as ([{role, text, timestamp}], truncated).
+
+    Read-only. Only user/assistant records with visible text are kept (tool calls and
+    tool results carry no text block and are skipped). ``truncated`` is True when more
+    than ``limit`` such messages exist.
+    """
+    messages, truncated = [], False
+    with Path(file_path).open("r", encoding="utf-8", errors="replace") as stream:
+        for line in stream:
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(record, dict) or record.get("type") not in ("user", "assistant"):
+                continue
+            message = record.get("message")
+            if not isinstance(message, dict):
+                continue
+            text = _content_text(message.get("content")).strip()
+            if not text:
+                continue
+            if len(messages) >= limit:
+                truncated = True
+                break
+            if len(text) > max_chars:
+                text = text[:max_chars] + "\n…"
+            messages.append({"role": record["type"], "text": text,
+                             "timestamp": _timestamp(record.get("timestamp"))})
+    return messages, truncated

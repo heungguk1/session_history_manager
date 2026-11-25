@@ -712,3 +712,104 @@ def test_list_items_project_labels_preview_count_and_time(filtered):
     assert rows[0]["last_activity_local"] == "오늘 01:00"
     assert rows[2]["preview"] == "y" * 119 + "…" and len(rows[2]["preview"]) == 120
     assert rows[2]["message_count"] == 3
+
+
+# ---------------------------------------------------------------- design (stage 2)
+
+def test_every_screen_uses_color_tokens_and_dark_mode(dashboard):
+    base = dashboard[0]
+    for path in ("/", "/search?q=exact", "/session/alpha-new"):
+        code, body = get(base + path)
+        assert code == 200
+        style = body[body.index("<style>"):body.index("</style>")]
+        assert ":root{" in style and "@media (prefers-color-scheme:dark)" in style
+        assert '<meta name="viewport"' in body
+        # Colours are defined once as tokens; rules after the token blocks only use var(--...).
+        rules = style[style.index("*{box-sizing"):]
+        assert "#" not in rules.replace("#fff", "")
+
+
+def test_list_has_project_sidebar_with_counts_and_active_item(dashboard):
+    base = dashboard[0]
+    code, body = get(base + "/?project=%2Fwork%2Falpha&q=exact")
+    assert code == 200 and '<aside class="sidebar">' in body and 'class="project-nav"' in body
+    sidebar = body[body.index('<aside class="sidebar">'):body.index("</aside>")]
+    assert '<span class="badge">2</span>' in sidebar                    # alpha has two visible sessions
+    active = sidebar[sidebar.index('<li class="is-active">'):]
+    assert active.startswith('<li class="is-active"><a href="/?project=%2Fwork%2Falpha&amp;q=exact"')
+    assert "hidden" not in sidebar and "encoded" not in sidebar
+
+
+def test_active_period_is_marked(dashboard):
+    base = dashboard[0]
+    code, body = get(base + "/")
+    assert '<span class="period is-active"><a href="/">전체</a></span>' in body
+
+
+def test_detail_shows_conversation_bubbles(tmp_path, monkeypatch):
+    root, db = tmp_path / "claude", tmp_path / "index.sqlite3"
+    directory = root / "-chat"
+    directory.mkdir(parents=True)
+    records = [
+        {"type": "user", "cwd": "/work/chat", "timestamp": "2024-03-01T00:00:00Z",
+         "message": {"content": "질문 <b>하나</b>"}},
+        {"type": "assistant", "timestamp": "2024-03-01T00:00:05Z",
+         "message": {"content": [{"type": "text", "text": "답변입니다"},
+                                 {"type": "tool_use", "name": "Bash", "input": {}}]}},
+        {"type": "user", "timestamp": "2024-03-01T00:00:06Z",
+         "message": {"content": [{"type": "tool_result", "content": "tool output"}]}},
+    ]
+    (directory / "chat-1.jsonl").write_text(
+        "\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n", encoding="utf-8")
+    with SessionIndex(db) as index:
+        index.index(root)
+    with running(db) as base:
+        code, body = get(base + "/session/chat-1")
+    assert code == 200
+    assert body.count('<div class="bubble user">') == 1 and body.count('<div class="bubble assistant">') == 1
+    assert "질문 &lt;b&gt;하나&lt;/b&gt;" in body and "<b>하나</b>" not in body
+    assert "답변입니다" in body and "tool output" not in body
+    assert '<a class="back-link" href="/">' in body
+
+
+def test_detail_survives_a_missing_session_file(dashboard):
+    base, _db, root = dashboard
+    (root / "-alpha" / "alpha-old.jsonl").unlink()
+    code, body = get(base + "/session/alpha-old")
+    assert code == 200 and "세션 파일을 읽을 수 없습니다" in body
+
+
+def test_read_messages_limits_long_sessions(tmp_path):
+    from shm.parser import read_messages
+    path = tmp_path / "long.jsonl"
+    path.write_text("".join(json.dumps({"type": "user", "message": {"content": "m%d" % i}}) + "\n"
+                            for i in range(5)), encoding="utf-8")
+    messages, truncated = read_messages(path, limit=3)
+    assert [m["text"] for m in messages] == ["m0", "m1", "m2"] and truncated
+    assert read_messages(path, limit=10) == ([{"role": "user", "text": "m%d" % i, "timestamp": None}
+                                              for i in range(5)], False)
+
+
+def test_director_role_prompt_sessions_are_hidden(tmp_path):
+    """AI DEV DIRECTOR's own HEAD/BUILDER/REVIEWER runs are not the user's conversations."""
+    root, db = tmp_path / "claude", tmp_path / "index.sqlite3"
+    write_session(root, "-app", "mine", "You are great, thanks", "2024-04-01T00:00:00Z")
+    prompts = {
+        "role-head": "You are HEAD, driving a multi-step development MISSION to completion",
+        "role-arch": "You are the HEAD architect making the final verdict on a development run.",
+        "role-build": "You are the implementation Builder. Do not use tools.",
+        "role-review": "You are an expert read-only code reviewer evaluating code",
+    }
+    for i, (sid, prompt) in enumerate(prompts.items()):
+        write_session(root, "-app", sid, prompt, "2024-04-02T00:00:0{}Z".format(i))
+    with SessionIndex(db) as index:
+        index.index(root)
+        assert [r["session_id"] for r in index.list_sessions(exclude_worktrees=True)] == ["mine"]
+        assert [r["session_id"] for r in index.search("You are", exclude_worktrees=True)] == ["mine"]
+        assert index.find_sessions("role-", exclude_worktrees=True) == []
+        assert [(r["project"], r["count"]) for r in index.project_counts(exclude_worktrees=True)] == [
+            ("/work/app", 1)]
+        assert len(index.list_sessions()) == 5                               # still indexed, only hidden
+    with running(db) as base:
+        assert ids(get_json(base + "/api/sessions")[1]) == ["mine"]
+        assert "role-" not in get(base + "/")[1]
